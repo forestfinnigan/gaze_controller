@@ -3,7 +3,7 @@
 #include "opencv2/highgui.hpp"
 #include "opencv2/ml.hpp"
 
-#define DATA_DIM 6
+#define DATA_DIM 2
 
 using namespace cv;
 using namespace cv::ml;

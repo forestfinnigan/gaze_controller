@@ -1,41 +1,8 @@
-///////////////////////////////////////////////////////////////////////////////
-// Copyright (C) 2017, Carnegie Mellon University and University of Cambridge,
-// all rights reserved.
-//
-// ACADEMIC OR NON-PROFIT ORGANIZATION NONCOMMERCIAL RESEARCH USE ONLY
-//
-// BY USING OR DOWNLOADING THE SOFTWARE, YOU ARE AGREEING TO THE TERMS OF THIS LICENSE AGREEMENT.  
-// IF YOU DO NOT AGREE WITH THESE TERMS, YOU MAY NOT USE OR DOWNLOAD THE SOFTWARE.
-//
-// License can be found in OpenFace-license.txt
-
-//     * Any publications arising from the use of this software, including but
-//       not limited to academic journal and conference publications, technical
-//       reports and manuals, must cite at least one of the following works:
-//
-//       OpenFace 2.0: Facial Behavior Analysis Toolkit
-//       Tadas Baltrušaitis, Amir Zadeh, Yao Chong Lim, and Louis-Philippe Morency
-//       in IEEE International Conference on Automatic Face and Gesture Recognition, 2018  
-//
-//       Convolutional experts constrained local model for facial landmark detection.
-//       A. Zadeh, T. Baltrušaitis, and Louis-Philippe Morency,
-//       in Computer Vision and Pattern Recognition Workshops, 2017.    
-//
-//       Rendering of Eyes for Eye-Shape Registration and Gaze Estimation
-//       Erroll Wood, Tadas Baltrušaitis, Xucong Zhang, Yusuke Sugano, Peter Robinson, and Andreas Bulling 
-//       in IEEE International. Conference on Computer Vision (ICCV),  2015 
-//
-//       Cross-dataset learning and person-specific normalisation for automatic Action Unit detection
-//       Tadas Baltrušaitis, Marwa Mahmoud, and Peter Robinson 
-//       in Facial Expression Recognition and Analysis Challenge, 
-//       IEEE International Conference on Automatic Face and Gesture Recognition, 2015 
-//
-///////////////////////////////////////////////////////////////////////////////
-// FaceTrackingVid.cpp : Defines the entry point for the console application for tracking faces in videos.
-
 // Libraries for landmark detection (includes CLNF and CLM modules)
 #include "LandmarkCoreIncludes.h"
 #include "GazeEstimation.h"
+#include "RotationHelpers.h"
+#include "GazeCamera.h"
 
 #include <SequenceCapture.h>
 #include <Visualizer.h>
@@ -44,7 +11,21 @@
 #include <iostream>
 #include <thread>
 #include <mutex>
-#include "svm.h"
+#include <fstream>
+#include "PlanarVisualization.h"
+#include <string>
+#include <opencv2/opencv.hpp>
+#include "geo2prob.h"
+// #include "geo3.h"
+// #include "lle.h"
+#include "lwlr.h"
+#include "pr.h"
+
+#include <time.h>
+#include <sstream>
+#include <fstream>
+
+using namespace cv;
 
 #define INFO_STREAM( stream ) \
 std::cout << stream << std::endl
@@ -55,35 +36,56 @@ std::cout << "Warning: " << stream << std::endl
 #define ERROR_STREAM( stream ) \
 std::cout << "Error: " << stream << std::endl
 
-#define NUM_TARGETS 3
-#define TRAINING_STEPS 50
-
-//mutex for the continue character
-std::mutex mtx;
-
 static void printErrorAndAbort(const std::string & error)
 {
 	std::cout << error << std::endl;
 	abort();
 }
 
-void read_buffer(char * buffer){
-	for(;;){
-		cin >> *buffer;
-	}
-}
-
-char read_char_async(char * buffer){
-	char ret;
-	ret = *buffer;
-	*buffer = '\0';
-	return ret;
-}
-
 #define FATAL_STREAM( stream ) \
 printErrorAndAbort( std::string( "Fatal error: " ) + stream )
 
+#define DATASET_SIZE 56 * 21 * 5
+
 using namespace std;
+
+float h = 500;
+float w = 920; 
+Mat rot =  (Mat_<float>(3,3) << .99, -.008, -.009, -.012, -.93, -.34, -.0061, -.35, -.93);
+Mat trans =  (Mat_<float>(3,1) << -100,200,530);
+Mat shift =  (Mat_<float>(3,1) << 120,-120,250);
+geo2prob g2 = geo2prob(rot, trans, shift);
+lwlr lw = lwlr(3);
+pr p = pr();
+//geo3 g3 = geo3(rot, trans, shift);
+// lle l = lle();
+
+// ofstream txtOutl;
+// ofstream txtOutr;
+
+//To read in clicks
+float data_l[9];
+float data_r[9];
+float * data[2] = {data_l, data_r};
+float d[2];
+void copyToArray(float * data, cv::Point3f p1, cv::Point3f p2, cv::Vec6d p3) {
+	data[0] = p1.x;data[1] = p1.y;data[2] = p1.z;
+	data[3] = p2.x;data[4] = p2.y;data[5] = p2.z;
+	data[6] = p3[3];data[7] = p3[4];data[8] = p3[5];
+}
+void cbmouse(int event, int x, int y, int flags, void*userdata)
+{
+   	if (event == EVENT_LBUTTONDOWN)
+   	{
+   		x = - 460 +  x;
+   		y = 500 - y;
+   		cout << x << "," << y << endl;
+   		//lw.add(d,x,0,y);
+   		p.add(d,x,0,y);
+      	// l.add(data[0], x, y, 1, NULL);
+      	// l.add(data[1], x, y, 0, NULL);
+   	}
+}
 
 vector<string> get_arguments(int argc, char **argv)
 {
@@ -97,185 +99,105 @@ vector<string> get_arguments(int argc, char **argv)
 	return arguments;
 }
 
-int mode(int labels[15]){
-	int best_label = 0;
-	int best_num_label = 0;
-	int num_of_label = 0;
-
-	for(int label = 0; label < NUM_TARGETS; label++){
-		for(int j = 0; j < 15; j++){
-			if(labels[j] == label){
-				num_of_label++;
-			}
-		}
-		if(num_of_label > best_num_label){
-			best_num_label = num_of_label;
-			best_label = label;
-		}
-		num_of_label = 0;
-	}
-
-	return best_label;
-}
-
 int main(int argc, char **argv)
 {
-
 	vector<string> arguments = get_arguments(argc, argv);
 
-	// no arguments
-	if(arguments.size() == 1){
-		// allowing the user to enter the arguement in the terminal
-		arguments.push_back("-device");
-		string dev_number;
-		cout << "Enter the camera device number: ";
-		cin >> dev_number;
-		cin.ignore();
-		cout << endl;
-		arguments.push_back(dev_number);
-	}
+	GazeCamera cam1(arguments);
 
-	//  explain usage of the program
-	cout << "\n\n#######################################################" << endl;
-	cout << "\n\n Enter a \'c\' to continue from one phase to next" << endl;
-	cout << "There are (# of targets phases) to record data for each target \n then there is a final phase to train and start testing \n\n" << endl;
-	cout << "#######################################################\n\n" << endl;
+	Mat out_image =  Mat::zeros( h, w, CV_8UC3 );
+	namedWindow( "Display window", WINDOW_AUTOSIZE );// Create a window for display.  
+	setMouseCallback("Display window", cbmouse, data);
+	// time_t t = time(NULL);
+	// struct tm tm = *localtime(&t);
+	// ofstream txtOut;
+	// ostringstream os;
+	// os << "data/data_" << tm.tm_mon + 1 << "-" << tm.tm_mday << "_" << tm.tm_hour << ":" << tm.tm_min << ".txt";
+	// string s = os.str();
+	// txtOut.open (s);
+	int i = 0; 
+	int steps = 50; 
+	int goalx = -225;
+	int goaly = 100;
+	// ostringstream osl;
+	// ostringstream osr; 
+	// osl << "data/data_l" << tm.tm_mon + 1 << "-" << tm.tm_mday << "_" << tm.tm_hour << ":" << tm.tm_min << ".txt";
+	// osr << "data/data_r" << tm.tm_mon + 1 << "-" << tm.tm_mday << "_" << tm.tm_hour << ":" << tm.tm_min << ".txt";
+	// string sl = osl.str();
+	// string sr = osr.str();
+	// txtOutl.open (sl);
+	// txtOutr.open (sr);
 
-	LandmarkDetector::FaceModelParameters det_parameters(arguments);
 
-	// The modules that are being used for tracking
-	LandmarkDetector::CLNF face_model(det_parameters.model_location);
-	if (!face_model.loaded_successfully)
+	PlanarVisualization pv(920, 500, 200);
+
+
+	INFO_STREAM("Starting tracking");
+	while (cam1.step() == true) // this is not a for loop as we might also be reading from a webcam
 	{
-		cout << "ERROR: Could not load the landmark detector" << endl;
-		return 1;
-	}
+		float x,y,z,x_raw,y_raw,z_raw;
+		float x3, y3, z3;
+		copyToArray(data_l, cam1.gazeDirectionLeft, cam1.eyeballCentreLeft, cam1.pose_estimate);
+		copyToArray(data_r, cam1.gazeDirectionRight, cam1.eyeballCentreRight, cam1.pose_estimate);
+		g2.eval(x,y,z,x_raw,y_raw,z_raw,cam1.gazeDirectionLeft, cam1.eyeballCentreLeft, cam1.gazeDirectionRight, cam1.eyeballCentreRight, cam1.pose_estimate, NULL);
+		// g3.eval(x3,y3,z3,x_raw,y_raw,z_raw,cam1.gazeDirectionLeft, cam1.eyeballCentreLeft, cam1.gazeDirectionRight, cam1.eyeballCentreRight, NULL);
+		// l.eval(x,y,z,x_raw,y_raw,z_raw,cam1.gazeDirectionLeft, cam1.eyeballCentreLeft, cam1.gazeDirectionRight, cam1.eyeballCentreRight, cam1.pose_estimate, NULL);
 
-	if (!face_model.eye_model)
-	{
-		cout << "WARNING: no eye model found" << endl;
-	}
+		out_image =  Mat::zeros( h, w, CV_8UC3 );
+		ellipse( out_image,
+           			Point(w/2 - x, h - z),
+           			Size( w/80.0, w/80.0 ),
+           			0,
+           			0,
+           			360,
+           			Scalar( 255, 255, 255),
+           			2,
+           			8);
+		line(out_image, Point(460 - 225, 500 - 100), Point(460 + 225, 500 - 100), Scalar( 0, 255, 255));
+    	line(out_image, Point(460 - 225, 500 - 400), Point(460 + 225, 500 - 400), Scalar( 0, 255, 255));
+    	line(out_image, Point(460 + 225, 500 - 100), Point(460 + 225, 500 - 400), Scalar( 0, 255, 255));
+    	line(out_image, Point(460 - 225, 500 - 100), Point(460 - 225, 500 - 400), Scalar( 0, 255, 255));
+		d[0] = x;
+		d[1] = z; 
+		//lw.eval(x,y,z, d);
+		int valid = p.eval(x,y,z, d);
 
-	// Open a sequence
-	Utilities::SequenceCapture sequence_reader;
-
-	// A utility for visualizing the results (show just the tracks)
-	Utilities::Visualizer visualizer(true, false, false, false);
-
-	// Tracking FPS for visualization
-	Utilities::FpsTracker fps_tracker;
-	fps_tracker.AddFrame();
-
-	// our mixture of gaussians classifier
-	svm k = svm();
-	int labeling_pos = -1;
-	int train_counter = 0;
-
-	int sequence_number = 0;
-	int points_recorded_for_curr_target = TRAINING_STEPS;
-	char cont;
-
-	// start the thread to record the the continue character
-	std::thread recording_thread(read_buffer, &cont);
-
-	while (true) // this is not a for loop as we might also be reading from a webcam
-	{
-
-		// The sequence reader chooses what to open based on command line arguments provided
-		if (!sequence_reader.Open(arguments))
-			break;
-
-		INFO_STREAM("Device or file opened");
-
-		cv::Mat rgb_image = sequence_reader.GetNextFrame();
-
-		INFO_STREAM("Starting tracking");
-		while (!rgb_image.empty()) // this is not a for loop as we might also be reading from a webcam
-		{
-
-			// Reading the images
-			cv::Mat_<uchar> grayscale_image = sequence_reader.GetGrayFrame();
-
-			// The actual facial landmark detection / tracking
-			bool detection_success = LandmarkDetector::DetectLandmarksInVideo(rgb_image, face_model, det_parameters, grayscale_image);
-
-			// Gaze tracking, absolute gaze direction
-			cv::Point3f gazeDirection0(0, 0, -1);
-			cv::Point3f gazeDirection1(0, 0, -1);
-
-			//eyeball centers 
-			cv::Point3f eyeballCentre1(0, 0, 0);
-			cv::Point3f eyeballCentre2(0, 0, 0);
-
-			cv::Vec6d pose_estimate = LandmarkDetector::GetPose(face_model, sequence_reader.fx, sequence_reader.fy, sequence_reader.cx, sequence_reader.cy);
-
-			// If tracking succeeded and we have an eye model, estimate gaze
-			if (detection_success && face_model.eye_model)
-			{
-				GazeAnalysis::EstimateGaze(face_model, gazeDirection0, eyeballCentre1, sequence_reader.fx, sequence_reader.fy, sequence_reader.cx, sequence_reader.cy, true);
-				GazeAnalysis::EstimateGaze(face_model, gazeDirection1, eyeballCentre2, sequence_reader.fx, sequence_reader.fy, sequence_reader.cx, sequence_reader.cy, false);
-
-				//for testing
-				cout << eyeballCentre1 << endl;
-
-				float data_point[6] = {static_cast<float>(pose_estimate[0]), 
-									   static_cast<float>(pose_estimate[1]), 
-									   static_cast<float>(pose_estimate[2]),
-									   gazeDirection0.x, 
-									   gazeDirection0.y, 
-									   gazeDirection0.z};			
-
-				if(points_recorded_for_curr_target >= TRAINING_STEPS && read_char_async(&cont) == 'c'){
-					points_recorded_for_curr_target = 0;
-					labeling_pos++;
-				}
-				if(labeling_pos < NUM_TARGETS && points_recorded_for_curr_target < TRAINING_STEPS){
-					k.add(data_point, labeling_pos);
-					cout << "Look at position  " << labeling_pos << ": " << points_recorded_for_curr_target << endl;
-					points_recorded_for_curr_target++;
-				} else if(labeling_pos == (NUM_TARGETS)){
-					k.cluster();
-					labeling_pos++;
-				} else if(labeling_pos > NUM_TARGETS) {
-					cout << k.eval(data_point) << endl;
-				}
-			}
-
-			// Keeping track of FPS
-			fps_tracker.AddFrame();
-
-			// Displaying the tracking visualizations
-			visualizer.SetImage(rgb_image, sequence_reader.fx, sequence_reader.fy, sequence_reader.cx, sequence_reader.cy);
-			visualizer.SetObservationLandmarks(face_model.detected_landmarks, face_model.detection_certainty, face_model.GetVisibilities());
-			visualizer.SetObservationPose(pose_estimate, face_model.detection_certainty);
-			visualizer.SetObservationGaze(gazeDirection0, gazeDirection1, LandmarkDetector::CalculateAllEyeLandmarks(face_model), LandmarkDetector::Calculate3DEyeLandmarks(face_model, sequence_reader.fx, sequence_reader.fy, sequence_reader.cx, sequence_reader.cy), face_model.detection_certainty);
-			visualizer.SetFps(fps_tracker.GetFPS());
-			// detect key presses (due to pecularities of OpenCV, you can get it when displaying images)
-			char character_press = visualizer.ShowObservation();
-
-			// restart the tracker
-			if (character_press == 'r')
-			{
-				face_model.Reset();
-			}
-			// quit the application
-			else if (character_press == 'q')
-			{
-				return(0);
-			}
-
-			// Grabbing the next frame in the sequence
-			rgb_image = sequence_reader.GetNextFrame();
-
+		if (valid == 1) {
+			// txtOut << goalx << "," << goaly << "," << x << "," << z << endl; 
+			if (goaly == 100 && goalx <225)
+				goalx+=5;
+			else if (goalx == 225 && goaly < 400)
+				goaly+=5;
+			else if (goaly == 400 && goalx > -225)
+				goalx-=5;
+			else 
+				goaly-=5;
 		}
+		ellipse( out_image,
+           			Point(w/2 + goalx, h - goaly),
+           			Size(20, 20),
+           			0,
+           			0,
+           			360,
+           			Scalar( 0, 0, 255),
+           			2,
+           			8);
 
-		// Reset the model, for the next video
-		face_model.Reset();
-		sequence_reader.Close();
-
-		sequence_number++;
-
+		ellipse( out_image,
+           			Point(w/2 + x, h - z),
+           			Size(w/80.0, w/80.0),
+           			0,
+           			0,
+           			360,
+           			Scalar( 0, 255, 255),
+           			2,
+           			8);
+		pv.drawGrid(out_image);
+		imshow( "Display window", out_image);
 	}
+	// txtOut.close();
+	// txtOutl.close();
+	// txtOutr.close();
+
 	return 0;
 }
-
